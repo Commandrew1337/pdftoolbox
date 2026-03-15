@@ -41,8 +41,16 @@ except Exception:
     fitz = None
     _FITZ_AVAILABLE = False
 
+# Pillow
+try:
+    from PIL import Image
+    _PIL_AVAILABLE = True
+except Exception:
+    Image = None
+    _PIL_AVAILABLE = False
+
 APP_TITLE = "PDF Toolbox"
-VERSION = "1.1"
+VERSION = "1.2"
 
 # ---------------- Utilities ----------------
 def ts_for_filename() -> str:
@@ -529,6 +537,13 @@ class CompressTab(BaseTab):
                 foreground="#a00"
             ).grid(row=0, column=0, sticky="w")
             return
+        if not _PIL_AVAILABLE:
+            ttk.Label(
+                grid,
+                text=("Pillow is required for image downsampling.\nInstall: pip install Pillow"),
+                foreground="#a00"
+            ).grid(row=0, column=0, sticky="w")
+            return
 
         ttk.Label(grid, text="Source PDF:").grid(row=0, column=0, sticky="w")
         ttk.Entry(grid, textvariable=self.src).grid(row=0, column=1, sticky="ew", padx=(6,6))
@@ -595,13 +610,25 @@ class CompressTab(BaseTab):
     def _needs_downsample(orig_w, orig_h, target_w, target_h):
         return (orig_w > target_w) or (orig_h > target_h)
 
+    def _pil_to_pixmap(self, pil_img: Image.Image) -> 'fitz.Pixmap':
+        """Create a fitz.Pixmap from a Pillow Image to avoid container/Filter mismatches."""
+        # Ensure color mode
+        if pil_img.mode not in ("RGB", "RGBA"):
+            pil_img = pil_img.convert("RGBA" if 'A' in pil_img.getbands() else "RGB")
+        w, h = pil_img.size
+        data = pil_img.tobytes()
+        if pil_img.mode == "RGBA":
+            pix = fitz.Pixmap(fitz.csRGB, w, h, data, alpha=True)
+        else:
+            pix = fitz.Pixmap(fitz.csRGB, w, h, data)
+        return pix
+
     def _downsample_images_in_doc(self, doc, target_ppi, jpeg_quality):
-        """In-place: iterate all pages and cap each image to target PPI (based on displayed size)."""
-        from io import BytesIO
-        try:
-            from PIL import Image
-        except Exception as e:
-            messagebox.showerror("Missing dependency", f"Pillow is required: {e}")
+        """In-place: iterate all pages and cap each image to target PPI (based on displayed size).
+        Uses Pixmap replacement to avoid 'insufficient data for an image' in some viewers.
+        """
+        if not _PIL_AVAILABLE:
+            messagebox.showerror("Missing dependency", "Pillow is required for image downsampling.")
             return 0
 
         processed = set()  # xrefs we already handled
@@ -647,34 +674,37 @@ class CompressTab(BaseTab):
                 if not self._needs_downsample(orig_w, orig_h, cap_w_px, cap_h_px):
                     continue
 
+                try:
+                    im = Image.open(io.BytesIO(orig_bytes))
+                except Exception:
+                    continue
+
+                # Compute new size while keeping aspect ratio
                 scale = min(cap_w_px / float(orig_w), cap_h_px / float(orig_h))
                 new_w = max(1, int(orig_w * scale))
                 new_h = max(1, int(orig_h * scale))
 
                 try:
-                    im = Image.open(BytesIO(orig_bytes))
-                    has_alpha = ("A" in im.getbands())
-                    if has_alpha:
-                        im = im.convert("RGBA")
-                        fmt = "PNG"
-                        buf = BytesIO()
-                        im.resize((new_w, new_h), Image.LANCZOS).save(buf, format=fmt, optimize=True)
-                        new_bytes = buf.getvalue()
-                    else:
-                        im = im.convert("RGB")
-                        fmt = "JPEG"
-                        buf = BytesIO()
-                        im.resize((new_w, new_h), Image.LANCZOS).save(
-                            buf, format=fmt, quality=int(jpeg_quality), optimize=True
-                        )
-                        new_bytes = buf.getvalue()
-                    try:
-                        doc.update_image(xref, new_bytes)
-                    except Exception:
-                        doc.update_stream(xref, new_bytes)
+                    # Resize with high-quality filter
+                    im = im.convert("RGBA" if 'A' in im.getbands() else "RGB")
+                    im_resized = im.resize((new_w, new_h), Image.LANCZOS)
+                    # Replace via Pixmap (avoids container mismatches)
+                    pix = self._pil_to_pixmap(im_resized)
+                    doc.update_image(xref, pixmap=pix)
                     replaced_count += 1
                 except Exception:
-                    pass
+                    # Fallback to encoded stream replacement
+                    try:
+                        buf = io.BytesIO()
+                        if im_resized.mode == "RGBA":
+                            im_resized.save(buf, format="PNG", optimize=True)
+                        else:
+                            im_resized.save(buf, format="JPEG", quality=int(jpeg_quality), optimize=True)
+                        new_bytes = buf.getvalue()
+                        doc.update_image(xref, stream=new_bytes)
+                        replaced_count += 1
+                    except Exception:
+                        pass
 
             self.set_progress(i + 1)
 
@@ -683,6 +713,9 @@ class CompressTab(BaseTab):
     def compress(self):
         if not _FITZ_AVAILABLE:
             messagebox.showerror("Missing dependency", "PyMuPDF (fitz) is required.")
+            return
+        if not _PIL_AVAILABLE:
+            messagebox.showerror("Missing dependency", "Pillow is required for image downsampling.")
             return
 
         src = self.src.get().strip()
@@ -724,10 +757,9 @@ class CompressTab(BaseTab):
                     except Exception:
                         has_images = False
                 else:
-                    has_images = True  # force evaluation of size logic below
+                    has_images = True
 
                 if self.skip_vector_only.get() and not has_images:
-                    # copy page exactly as-is
                     out_doc.insert_pdf(in_doc, from_page=pno, to_page=pno)
                     self.set_progress(pno + 1)
                     continue
@@ -779,13 +811,10 @@ class PDFToolboxApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_TITLE} v{VERSION}")
-        # Build UI first so Tk can compute natural/requested sizes
         self._build()
-        # --- Auto-size to the smallest needed dimensions ---
-        self.update_idletasks()  # let geometry settle
+        self.update_idletasks()
         req_w = self.winfo_reqwidth()
         req_h = self.winfo_reqheight()
-        # Set geometry to requested size and lock it as the minimum
         self.geometry(f'{req_w}x{req_h}')
         self.minsize(req_w, req_h)
         self.resizable(True, True)
@@ -798,10 +827,11 @@ class PDFToolboxApp(tk.Tk):
         nb.add(ImagesTab(nb), text="Extract Images")
         nb.add(TextTab(nb), text="PDF → Text")
         nb.add(UnlockTab(nb), text="Unlock")
-        nb.add(CompressTab(nb), text="Compress")  # new tab
+        nb.add(CompressTab(nb), text="Compress")
 
 def main():
     PDFToolboxApp().mainloop()
 
 if __name__=="__main__":
+    import io  # used in CompressTab for BytesIO
     main()
