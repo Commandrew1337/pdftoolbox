@@ -1,24 +1,26 @@
+
 # -*- coding: utf-8 -*-
 """
 PDF Toolbox GUI — One window for common PDF tasks
-
 Includes tabs for:
-  • Merge PDFs from a folder (natural sort) — Save As picker (no list)
-  • Extract selected pages to a new PDF
-  • Remove selected pages and save as new PDF
-  • Insert one PDF into another (beginning/end/before/after page N)
-  • Extract images from a PDF (requires PyMuPDF/fitz; tab disables if missing)
-  • Convert PDF text to paragraphs and save as .txt
-  • Unlock a password-protected PDF (copy pages to a new, unencrypted file)
+ • Merge PDFs from a folder (natural sort) — Save As picker (no list)
+ • Extract selected pages to a new PDF
+ • Remove selected pages and save as new PDF
+ • Insert one PDF into another (beginning/end/before/after page N)
+ • Extract images from a PDF (requires PyMuPDF/fitz; tab disables if missing)
+ • Convert PDF text to paragraphs and save as .txt
+ • Unlock a password-protected PDF (copy pages to a new, unencrypted file)
+ • Compress: shrink oversized pages to 8.5×11 in and downsample images to a target PPI
 
 Dependencies:
-  - PyPDF2 (required)
-  - PyMuPDF / fitz (optional; only for the Extract Images tab)
+ - PyPDF2 (required)
+ - PyMuPDF / fitz (optional; Extract Images & Compress)
+ - Pillow (optional; Compress image downsampling)
 """
 from __future__ import annotations
 
 # --- stdlib ---
-import os, re, platform, subprocess
+import os, re
 from datetime import datetime
 from pathlib import Path
 
@@ -40,10 +42,9 @@ except Exception:
     _FITZ_AVAILABLE = False
 
 APP_TITLE = "PDF Toolbox"
-VERSION = "1.0"
+VERSION = "1.1"
 
 # ---------------- Utilities ----------------
-
 def ts_for_filename() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -51,7 +52,6 @@ def natural_key(s: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
 # ---------------- Page range parsing ----------------
-
 def parse_page_selection_extract(selection: str, total_pages: int):
     if not selection:
         raise ValueError("No pages entered.")
@@ -101,7 +101,6 @@ def parse_page_selection_remove(selection: str, total_pages: int):
     return sorted(pages_to_remove)
 
 # ---------------- Text extraction helpers ----------------
-
 def extract_text_from_pdf(pdf_path: str) -> str:
     reader = PdfReader(pdf_path)
     return "\n\n".join((page.extract_text() or "") for page in reader.pages)
@@ -114,7 +113,7 @@ def reflow_paragraphs(raw_text: str) -> str:
         if not buf: return
         parts=[]
         for i,line in enumerate(buf):
-            line=line.strip();
+            line=line.strip()
             if not line: continue
             if i==0: parts.append(line)
             else:
@@ -134,13 +133,15 @@ class BaseTab(ttk.Frame):
         super().__init__(master)
         self.status_var = tk.StringVar(value="Ready.")
         self.progress = ttk.Progressbar(self, orient="horizontal", mode="determinate")
-    def set_status(self, text: str): self.status_var.set(text)
+    def set_status(self, text: str):
+        self.status_var.set(text)
     def set_progress_mode(self, mode: str):
         self.progress.config(mode=mode)
         (self.progress.start(10) if mode=="indeterminate" else self.progress.stop())
-    def set_progress(self, value: int, maximum: int|None=None):
-        if maximum is not None: self.progress.config(maximum=maximum)
-        self.progress['value']=value
+    def set_progress(self, value: int, maximum: int | None = None):
+        if maximum is not None:
+            self.progress.config(maximum=maximum)
+        self.progress['value'] = value
 
 # ---------------- Merge (no listbox; Save As) ----------------
 class MergeTab(BaseTab):
@@ -383,7 +384,7 @@ class ImagesTab(BaseTab):
         pad={"padx":10,"pady":8}
         grid=ttk.Frame(self); grid.grid(row=0,column=0,sticky="nsew",**pad); self.columnconfigure(0,weight=1)
         if not _FITZ_AVAILABLE:
-            ttk.Label(grid,text=("PyMuPDF (fitz) is not installed. Install with:\n    pip install pymupdf\n\nThis tab will remain disabled until fitz is available."),foreground="#a00").grid(row=0,column=0,sticky="w"); return
+            ttk.Label(grid,text=("PyMuPDF (fitz) is not installed. Install with:\n pip install pymupdf\n\nThis tab will remain disabled until fitz is available."),foreground="#a00").grid(row=0,column=0,sticky="w"); return
         ttk.Label(grid,text="Source PDF:").grid(row=0,column=0,sticky="w")
         ttk.Entry(grid,textvariable=self.src).grid(row=0,column=1,sticky="ew",padx=(6,6)); grid.columnconfigure(1,weight=1)
         ttk.Button(grid,text="Browse…",command=self._browse_src).grid(row=0,column=2)
@@ -498,6 +499,281 @@ class UnlockTab(BaseTab):
             self.set_status(f"Unlocked → {dst}"); messagebox.showinfo("Success",f"Unlocked PDF saved to:\n{dst}")
         except Exception as e: messagebox.showerror("Error",str(e))
 
+# ---------------- Compress (Resize pages + Downsample images) ----------------
+class CompressTab(BaseTab):
+    LETTER_W = 612   # 8.5 in * 72
+    LETTER_H = 792   # 11  in * 72
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.src = tk.StringVar()
+        self.dst = tk.StringVar()
+        self.target_ppi = tk.IntVar(value=150)       # cap effective image resolution
+        self.jpeg_quality = tk.IntVar(value=80)      # JPEG quality for non-alpha images
+        self.shrink_only = tk.BooleanVar(value=True) # do not upscale small pages
+        self.skip_vector_only = tk.BooleanVar(value=True)  # new toggle
+        self._build()
+
+    def _build(self):
+        pad = {"padx": 10, "pady": 8}
+        grid = ttk.Frame(self)
+        grid.grid(row=0, column=0, sticky="nsew", **pad)
+        self.columnconfigure(0, weight=1)
+
+        if not _FITZ_AVAILABLE:
+            ttk.Label(
+                grid,
+                text=("PyMuPDF (fitz) is required for compression.\n"
+                      "Install with:\n  pip install pymupdf\n\n"
+                      "This tab will remain disabled until fitz is available."),
+                foreground="#a00"
+            ).grid(row=0, column=0, sticky="w")
+            return
+
+        ttk.Label(grid, text="Source PDF:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(grid, textvariable=self.src).grid(row=0, column=1, sticky="ew", padx=(6,6))
+        grid.columnconfigure(1, weight=1)
+        ttk.Button(grid, text="Browse…", command=self._browse_src).grid(row=0, column=2)
+
+        ttk.Label(grid, text="Save compressed As:").grid(row=1, column=0, sticky="w")
+        ttk.Entry(grid, textvariable=self.dst).grid(row=1, column=1, sticky="ew", padx=(6,6))
+        ttk.Button(grid, text="Choose…", command=self._browse_dst).grid(row=1, column=2)
+
+        opts = ttk.Labelframe(grid, text="Compression Options")
+        opts.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+
+        row = ttk.Frame(opts); row.pack(fill="x", padx=8, pady=6)
+        ttk.Label(row, text="Target image PPI:").pack(side="left")
+        ttk.Spinbox(row, from_=72, to=600, increment=6, width=6,
+                    textvariable=self.target_ppi).pack(side="left", padx=(6,12))
+        ttk.Label(row, text="JPEG quality:").pack(side="left")
+        slider = ttk.Scale(row, from_=40, to=95, orient="horizontal",
+                           variable=self.jpeg_quality)
+        slider.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+        ttk.Checkbutton(opts, text="Only shrink oversize pages (keep smaller sizes)",
+                        variable=self.shrink_only).pack(anchor="w", padx=8)
+        ttk.Checkbutton(opts, text="Skip vector-only pages (no raster images)",
+                        variable=self.skip_vector_only).pack(anchor="w", padx=8, pady=(2,8))
+
+        status = ttk.Frame(self); status.grid(row=1, column=0, sticky="ew", padx=10)
+        ttk.Label(status, textvariable=self.status_var).pack(anchor="w")
+        self.progress.pack(in_=status, fill="x", pady=(4, 0))
+
+        ttk.Button(self, text="Compress PDF", command=self.compress)           .grid(row=2, column=0, sticky="e", padx=10, pady=(0,10))
+
+    def _browse_src(self):
+        path = filedialog.askopenfilename(title="Select PDF", filetypes=[("PDF files","*.pdf")])
+        if path:
+            self.src.set(path)
+            base = Path(path)
+            suggested = base.with_name(f"{base.stem}_compressed_{ts_for_filename()}.pdf")
+            self.dst.set(str(suggested))
+
+    def _browse_dst(self):
+        path = filedialog.asksaveasfilename(
+            title="Save compressed PDF as…",
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf")]
+        )
+        if path:
+            self.dst.set(path)
+
+    # --- helpers for image downsampling ---
+    @staticmethod
+    def _largest_display_rect(page, xref):
+        """Return the largest rectangle (by area) where image xref is drawn on this page."""
+        try:
+            rects = page.get_image_rects(xref)
+        except Exception:
+            return None
+        if not rects:
+            return None
+        return max(rects, key=lambda r: (r.width * r.height))
+
+    @staticmethod
+    def _needs_downsample(orig_w, orig_h, target_w, target_h):
+        return (orig_w > target_w) or (orig_h > target_h)
+
+    def _downsample_images_in_doc(self, doc, target_ppi, jpeg_quality):
+        """In-place: iterate all pages and cap each image to target PPI (based on displayed size)."""
+        from io import BytesIO
+        try:
+            from PIL import Image
+        except Exception as e:
+            messagebox.showerror("Missing dependency", f"Pillow is required: {e}")
+            return 0
+
+        processed = set()  # xrefs we already handled
+        replaced_count = 0
+
+        total_pages = len(doc)
+        self.set_progress_mode("determinate"); self.set_progress(0, total_pages)
+
+        for i in range(total_pages):
+            page = doc.load_page(i)
+            try:
+                images = page.get_images(full=True)
+            except Exception:
+                images = []
+
+            for img in images:
+                xref = img[0]
+                if xref in processed:
+                    continue
+                processed.add(xref)
+
+                rect = self._largest_display_rect(page, xref)
+                if rect is None:
+                    continue
+
+                disp_w_pt, disp_h_pt = rect.width, rect.height
+                disp_w_in = max(1e-6, disp_w_pt / 72.0)
+                disp_h_in = max(1e-6, disp_h_pt / 72.0)
+                cap_w_px = int(round(disp_w_in * target_ppi))
+                cap_h_px = int(round(disp_h_in * target_ppi))
+
+                try:
+                    info = doc.extract_image(xref)
+                except Exception:
+                    continue
+
+                orig_bytes = info.get("image", b"")
+                orig_w = info.get("width")
+                orig_h = info.get("height")
+                if not orig_bytes or not orig_w or not orig_h:
+                    continue
+
+                if not self._needs_downsample(orig_w, orig_h, cap_w_px, cap_h_px):
+                    continue
+
+                scale = min(cap_w_px / float(orig_w), cap_h_px / float(orig_h))
+                new_w = max(1, int(orig_w * scale))
+                new_h = max(1, int(orig_h * scale))
+
+                try:
+                    im = Image.open(BytesIO(orig_bytes))
+                    has_alpha = ("A" in im.getbands())
+                    if has_alpha:
+                        im = im.convert("RGBA")
+                        fmt = "PNG"
+                        buf = BytesIO()
+                        im.resize((new_w, new_h), Image.LANCZOS).save(buf, format=fmt, optimize=True)
+                        new_bytes = buf.getvalue()
+                    else:
+                        im = im.convert("RGB")
+                        fmt = "JPEG"
+                        buf = BytesIO()
+                        im.resize((new_w, new_h), Image.LANCZOS).save(
+                            buf, format=fmt, quality=int(jpeg_quality), optimize=True
+                        )
+                        new_bytes = buf.getvalue()
+                    try:
+                        doc.update_image(xref, new_bytes)
+                    except Exception:
+                        doc.update_stream(xref, new_bytes)
+                    replaced_count += 1
+                except Exception:
+                    pass
+
+            self.set_progress(i + 1)
+
+        return replaced_count
+
+    def compress(self):
+        if not _FITZ_AVAILABLE:
+            messagebox.showerror("Missing dependency", "PyMuPDF (fitz) is required.")
+            return
+
+        src = self.src.get().strip()
+        dst = self.dst.get().strip()
+        if not src or not os.path.isfile(src):
+            messagebox.showerror("Missing file", "Select a valid source PDF.")
+            return
+        if not dst:
+            messagebox.showerror("Missing output", "Choose where to save the compressed PDF.")
+            return
+
+        try:
+            in_doc = fitz.open(src)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open PDF: {e}")
+            return
+
+        try:
+            # 1) Downsample images in place on the source doc
+            self.set_status("Downsampling images…")
+            replaced = self._downsample_images_in_doc(
+                in_doc, target_ppi=self.target_ppi.get(), jpeg_quality=self.jpeg_quality.get()
+            )
+
+            # 2) Build the output doc with page-size adjustments (Letter shrink-to-fit)
+            out_doc = fitz.open()
+            total = len(in_doc)
+            self.set_status("Resizing oversized pages…")
+            self.set_progress_mode("determinate"); self.set_progress(0, total)
+
+            for pno in range(total):
+                page = in_doc.load_page(pno)
+                w, h = page.rect.width, page.rect.height
+
+                # Skip vector-only pages if requested
+                if self.skip_vector_only.get():
+                    try:
+                        has_images = bool(page.get_images(full=True))
+                    except Exception:
+                        has_images = False
+                else:
+                    has_images = True  # force evaluation of size logic below
+
+                if self.skip_vector_only.get() and not has_images:
+                    # copy page exactly as-is
+                    out_doc.insert_pdf(in_doc, from_page=pno, to_page=pno)
+                    self.set_progress(pno + 1)
+                    continue
+
+                if self.shrink_only.get():
+                    need_shrink = (w > self.LETTER_W) or (h > self.LETTER_H)
+                else:
+                    need_shrink = True
+
+                if need_shrink:
+                    sx = self.LETTER_W / float(w)
+                    sy = self.LETTER_H / float(h)
+                    s = min(sx, sy)
+                    new_w, new_h = w * s, h * s
+                    left = (self.LETTER_W - new_w) / 2.0
+                    top  = (self.LETTER_H - new_h) / 2.0
+                    target_rect = fitz.Rect(left, top, left + new_w, top + new_h)
+                    dst_page = out_doc.new_page(width=self.LETTER_W, height=self.LETTER_H)
+                    dst_page.show_pdf_page(target_rect, in_doc, pno)
+                else:
+                    out_doc.insert_pdf(in_doc, from_page=pno, to_page=pno)
+
+                self.set_progress(pno + 1)
+
+            self.set_status("Writing output…")
+            out_doc.save(dst, deflate=True, clean=True, garbage=4)
+            out_doc.close()
+            in_doc.close()
+
+            msg = f"Done → {dst}"
+            if replaced:
+                msg += f"\nImages downsampled: {replaced}"
+            self.set_status(msg)
+            messagebox.showinfo("Compression complete", msg)
+
+        except Exception as e:
+            try:
+                out_doc.close()
+            except Exception:
+                pass
+            try:
+                in_doc.close()
+            except Exception:
+                pass
+            messagebox.showerror("Error", f"Compression failed: {e}")
+
 # ---------------- Main app ----------------
 class PDFToolboxApp(tk.Tk):
     def __init__(self):
@@ -512,9 +788,7 @@ class PDFToolboxApp(tk.Tk):
         # Set geometry to requested size and lock it as the minimum
         self.geometry(f'{req_w}x{req_h}')
         self.minsize(req_w, req_h)
-        # Optional: keep resizable; user can expand if they want
         self.resizable(True, True)
-
     def _build(self):
         nb=ttk.Notebook(self); nb.pack(fill="both",expand=True)
         nb.add(MergeTab(nb), text="Merge")
@@ -524,6 +798,7 @@ class PDFToolboxApp(tk.Tk):
         nb.add(ImagesTab(nb), text="Extract Images")
         nb.add(TextTab(nb), text="PDF → Text")
         nb.add(UnlockTab(nb), text="Unlock")
+        nb.add(CompressTab(nb), text="Compress")  # new tab
 
 def main():
     PDFToolboxApp().mainloop()
